@@ -1,0 +1,9 @@
+{
+  "name": "graphql-sns-lab",
+  "private": true,
+  "scripts": {
+    "dev:server": "pnpm --filter server dev",
+    "dev:web": "pnpm --filter web dev",
+    "test": "pnpm --filter server test"
+  }
+}
