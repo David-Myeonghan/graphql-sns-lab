@@ -47,6 +47,8 @@ builder.prismaObject('Post', {
     createdAt: t.string({ resolve: (p) => p.createdAt.toISOString() }),
     author: t.relation('author'),
     comments: t.relation('comments'),
+    likeCount: t.relationCount('likes'),
+    likedByMe: t.boolean({ resolve: (p, _a, ctx) => ctx.loaders.myLikes.load(p.id) }),
   }),
 });
 
@@ -84,6 +86,19 @@ builder.mutationType({
       args: { name: t.arg.string({ required: true }) },
       resolve: (query, _root, args, ctx) =>
         ctx.prisma.user.update({ ...query, where: { id: ctx.userId }, data: { name: args.name } }),
+    }),
+    toggleLike: t.prismaField({
+      type: 'Post',
+      args: { postId: t.arg.int({ required: true }) },
+      resolve: async (query, _root, args, ctx) => {
+        // 📚 LEARN(P7): 실패 롤백 실험용 스위치 — FAIL_LIKES=1 pnpm dev 로 켠다
+        if (process.env.FAIL_LIKES) throw new Error('like intentionally failed');
+        const where = { userId_postId: { userId: ctx.userId, postId: args.postId } };
+        const existing = await ctx.prisma.like.findUnique({ where });
+        if (existing) await ctx.prisma.like.delete({ where });
+        else await ctx.prisma.like.create({ data: { userId: ctx.userId, postId: args.postId } });
+        return ctx.prisma.post.findUniqueOrThrow({ ...query, where: { id: args.postId } });
+      },
     }),
   }),
 });

@@ -24,12 +24,20 @@ prisma.$on('query', (e) => {
 // "클라이언트가 쿼리 모양을 정하면 서버는 접근 패턴을 예측할 수 없다"의 서버측 처방.
 // (Comment.author는 findFirst라 Prisma의 findUnique 전용 자동배칭 대상이 아니었다 —
 // 그 배칭을 GraphQL 리졸버 레벨에서 우리가 직접 재구현하는 것이 DataLoader다.)
-export function createLoaders() {
+export function createLoaders(currentUserId: number) {
   return {
     user: new DataLoader<number, { id: number; name: string; avatarUrl: string }>(async (ids) => {
       const users = await prisma.user.findMany({ where: { id: { in: [...ids] } } });
       const map = new Map(users.map((u) => [u.id, u]));
       return ids.map((id) => map.get(id)!);
+    }),
+    // 📚 LEARN(P7): P3와 같은 패턴 — 피드 10개의 likedByMe도 IN 1방으로.
+    myLikes: new DataLoader<number, boolean>(async (postIds) => {
+      const likes = await prisma.like.findMany({
+        where: { postId: { in: [...postIds] }, userId: currentUserId },
+      });
+      const liked = new Set(likes.map((l) => l.postId));
+      return postIds.map((id) => liked.has(id));
     }),
   };
 }
@@ -41,6 +49,7 @@ export interface Context {
 }
 
 export function createContext(request: Request): Context {
+  const userId = Number(request.headers.get('x-user-id') ?? 1);
   // 📚 LEARN(P3): loader는 요청마다 새로 만든다 — 요청 간 캐시 공유는 stale/권한 누수
-  return { userId: Number(request.headers.get('x-user-id') ?? 1), prisma, loaders: createLoaders() };
+  return { userId, prisma, loaders: createLoaders(userId) };
 }

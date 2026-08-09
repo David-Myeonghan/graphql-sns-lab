@@ -430,3 +430,102 @@ false`)에서는 `fetchMore` 중에 `loading`이 다시 true가 되지 않지만
    않는지(`pageInfo.hasNextPage: false`가 되어 `useEffect`가 observer를 다시 안 다는 상태) 확인
 5. Apollo Client Devtools "Cache" 탭에서 `ROOT_QUERY.feed` 엔트리를 열어 `edges` 배열이 fetchMore
    이후에도 하나로 이어붙어 있는지(손으로 짠 merge 코드 없이) 확인
+
+## Phase 7 체감 기록
+
+이 커밋의 diff 핵심: `Post`에 `likeCount`(`t.relationCount('likes')`)/`likedByMe`(P3와 같은
+DataLoader 패턴 재사용, `context.ts`의 `myLikes`) 필드 추가, `toggleLike` mutation 신설,
+`Feed.tsx`에 하트 버튼 + `optimisticResponse` 추가. `myLikes` 로더가 `currentUserId`를 알아야 해서
+`createLoaders()` → `createLoaders(currentUserId: number)`로 시그니처가 바뀌고, `createContext`가
+헤더에서 뽑은 `userId`를 그대로 넘겨준다.
+
+### 헤드리스 실측 (1) — 성공 경로
+
+서버(`pnpm --filter server dev`, 4000) 기동 후 curl 직결. 시드 상태: `Like` 15행, 전부
+`userId=2`(Ben)가 홀수 id 포스트(i%2==0 → id=i+1)에 좋아요. 기본 `x-user-id`는 헤더가 없으면 1
+(Ava) — post 1은 Ben이 이미 좋아요를 눌러둔 상태라 Ava 기준 `likedByMe: false`, `likeCount: 1`에서
+시작:
+
+```
+$ curl -s :4000/graphql -d '{"query":"{ post(id: 1) { id likeCount likedByMe } }"}'
+{"data":{"post":{"id":1,"likeCount":1,"likedByMe":false}}}
+
+$ curl -s :4000/graphql -d '{"query":"mutation($postId:Int!){ toggleLike(postId:$postId){ id likeCount likedByMe } }","variables":{"postId":1}}'
+{"data":{"toggleLike":{"id":1,"likeCount":2,"likedByMe":true}}}   # Ava가 좋아요 추가
+
+$ sqlite3 dev.db "SELECT userId, postId FROM Like WHERE postId=1;"
+2|1
+1|1                                                                # Ben(기존) + Ava(신규) 두 행
+
+$ curl -s :4000/graphql -d '{"query":"mutation($postId:Int!){ toggleLike(postId:$postId){ id likeCount likedByMe } }","variables":{"postId":1}}'
+{"data":{"toggleLike":{"id":1,"likeCount":1,"likedByMe":false}}}  # 다시 토글 → 원상복구
+
+$ sqlite3 dev.db "SELECT userId, postId FROM Like WHERE postId=1;"
+2|1                                                                # Ben 행만 남음
+
+$ sqlite3 dev.db "SELECT count(*) FROM Like;"
+15                                                                 # 시드 상태와 정확히 일치
+```
+
+`likeCount`/`likedByMe`의 flip과 `Like` 테이블의 행 생성/삭제가 정확히 대응하고, 두 번째 토글로
+Ava의 좋아요 행이 사라져 DB가 시드 상태(15행, 전부 Ben)로 완전히 복원됨을 실측으로 확인했다.
+
+### 헤드리스 실측 (2) — 실패 경로 + 자동 롤백
+
+서버를 껐다가 `FAIL_LIKES=1 pnpm dev`로 재기동(`toggleLike` 리졸버가 DB를 건드리기 전에 무조건
+throw):
+
+```
+$ curl -s :4000/graphql -d '{"query":"{ post(id: 1) { id likeCount likedByMe } }"}'
+{"data":{"post":{"id":1,"likeCount":1,"likedByMe":false}}}
+
+$ curl -s :4000/graphql -d '{"query":"mutation($postId:Int!){ toggleLike(postId:$postId){ id likeCount likedByMe } }","variables":{"postId":1}}'
+{"errors":[{"message":"Unexpected error.","path":["toggleLike"],"extensions":{"code":"INTERNAL_SERVER_ERROR"}}],"data":{"toggleLike":null}}
+
+$ sqlite3 dev.db "SELECT userId, postId FROM Like WHERE postId=1;"
+2|1                                                                # 변화 없음
+
+$ sqlite3 dev.db "SELECT count(*) FROM Like;"
+15                                                                 # 변화 없음
+```
+
+**계획에 없던 실측 편차**: 브리프의 `throw new Error('like intentionally failed')` 메시지가
+응답에 그대로 안 나온다 — graphql-yoga가 기본으로 `maskedErrors: true`라 서버 내부 에러 메시지를
+`"Unexpected error."`로 가리고 `extensions.code: INTERNAL_SERVER_ERROR`만 노출한다(P4에서 본
+"검증 에러는 HTTP 200 + errors 배열"과 같은 결의 스펙 준수 — 다만 이번엔 데이터 노출 방지가
+이유). 이 실험 목적(에러 발생 시 DB 미변경 + 클라 롤백)에는 메시지 내용이 필요 없어 영향 없음.
+
+이 두 실측 모두 curl(raw HTTP)로 확인한 것은 "서버가 성공/실패 양쪽에서 DB를 정확히 그 경우에
+맞게 (안) 바꾼다"는 사실이다. optimistic UI 자체(즉시 하트 → 실패 시 자동 롤백)는 Apollo Client의
+캐시 레이어가 브라우저에서 하는 일이라 curl로는 관찰 불가 — 아래 수동 절차로 남긴다.
+
+### mutation 후 갱신 전략 3가지 — 이 레포에서 각각 어디서 겪었나
+
+| 전략 | 이 레포에서 겪은 곳 | 방식 |
+|---|---|---|
+| refetch류 (전체/일부 재조회) | P2 `Profile.tsx`의 `invalidateAll()` | mutation 후 캐시를 통째로 비워 다음 조회가 강제로 network을 타게 함 — "이 mutation이 어떤 쿼리를 stale하게 만드는지"를 사람이 알아야 하고, 안 지워도 될 캐시까지 날린다 |
+| 캐시 수정 (수동 merge 정책) | P6 `apollo.ts`의 `relayStylePagination()` | `fetchMore`로 받은 다음 페이지를 기존 `edges` 뒤에 이어붙이는 규칙을 캐시 타입폴리시로 등록 — "새 데이터를 기존 캐시에 어떻게 합칠지"를 명시적으로 정의(직접 짜지는 않았지만 정책은 존재) |
+| 정규화 자동 갱신 | P5 `Profile.tsx`의 `updateMyName`, P7 `Feed.tsx`의 `toggleLike` | mutation 응답에 `id`(+바뀐 필드)만 있으면 `InMemoryCache`가 `Post:{id}`/`User:{id}` 엔티티를 정규화 키로 자동 갱신 — 그 엔티티를 참조하는 모든 활성 쿼리가 refetch/merge 코드 한 줄 없이 다시 그려짐. P7의 `toggleLike { id likeCount likedByMe }`가 이 최소 응답 패턴 |
+
+P7은 여기에 `optimisticResponse`를 얹은 것 — 정규화 자동 갱신이 "서버 응답 도착 후"에 일어나는
+갱신이라면, `optimisticResponse`는 그 갱신을 **낙관적으로 먼저** 캐시에 써서 체감 지연을 0으로
+만들고, 서버가 실제로 에러를 던지면 Apollo가 이 임시 레이어만 골라서 걷어내(진짜 서버 데이터는
+건드린 적이 없으므로) 자동 롤백한다.
+
+### 수동 재현 절차 — 낙관적 반응 + 자동 롤백 (미실행, 헤드리스 환경 한계)
+
+에이전트는 브라우저를 조작하지 않았다 — "클릭 즉시 하트가 뒤집히는 체감"과 "에러 응답 도착 시
+원상복구되는 체감"은 실제 브라우저의 React 재렌더 없이는 관찰 불가능하다. David가 직접 확인할
+절차:
+
+1. **정상 경로**: `pnpm dev:server`(4000) + `pnpm dev:web`(5173) 기동, `http://localhost:5173`
+   접속 → 피드 탭에서 아무 포스트의 하트 버튼 클릭 → 네트워크 응답이 오기 전부터(개발자도구
+   Network 탭에서 `/graphql` pending 상태 확인) 하트/카운트가 이미 뒤집혀 있는지 확인 → 응답
+   도착 후에도 그대로 유지되는지 확인
+2. **실패 경로 (자동 롤백)**: 서버를 끄고 `cd server && FAIL_LIKES=1 pnpm dev`로 재기동 → 같은
+   하트 버튼 클릭 → **클릭 즉시 하트가 뒤집혔다가**, 서버 에러 응답이 도착하는 순간(Network 탭에
+   해당 요청이 빨간색으로 실패 표시) **자동으로 원래 상태로 되돌아오는지** 확인 — `Feed.tsx`에
+   `onError`나 `catch` 코드를 한 줄도 안 썼는데 롤백되는 것이 P7의 핵심 체감이다. 화면
+   녹화(선택) 또는 눈으로 왕복 확인 후 `FAIL_LIKES` 없이 서버 재기동
+3. 확인 후 DB는 헤드리스 실측 단계에서 이미 시드 상태(15행, 전부 Ben)로 복원해뒀다 — 수동 절차
+   중 실수로 좋아요를 눌러 상태가 바뀌었다면 같은 버튼을 한 번 더 눌러 원상복구할 것
