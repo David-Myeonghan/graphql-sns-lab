@@ -1,0 +1,56 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+generator pothos {
+  provider     = "prisma-pothos-types"
+  // 📚 LEARN(P1) 편차: clientOutput은 이 pothos 출력 파일(위 output) 자신의 위치를 기준으로 한
+  // "import 경로"로 그대로 쓰인다(스키마 기준 경로가 아님, generator가 내부적으로 "/client.js"를
+  // 이어붙임). pothos-types.ts가 src/generated/에, prisma client가 src/generated/prisma/에 있으니
+  // 상대경로는 "./prisma" → "./prisma/client.js". 브리프 원문 "../src/generated/prisma/client"는
+  // "prisma/client/client.js"라는 존재하지 않는 경로를 만들어 타입 import가 깨졌다.
+  clientOutput = "./prisma"
+  output       = "../src/generated/pothos-types.ts"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id        Int       @id @default(autoincrement())
+  name      String
+  avatarUrl String
+  posts     Post[]
+  comments  Comment[]
+  likes     Like[]
+}
+
+model Post {
+  id        Int       @id @default(autoincrement())
+  body      String
+  createdAt DateTime  @default(now())
+  author    User      @relation(fields: [authorId], references: [id])
+  authorId  Int
+  comments  Comment[]
+  likes     Like[]
+}
+
+model Comment {
+  id       Int    @id @default(autoincrement())
+  body     String
+  post     Post   @relation(fields: [postId], references: [id])
+  postId   Int
+  author   User   @relation(fields: [authorId], references: [id])
+  authorId Int
+}
+
+model Like {
+  user   User @relation(fields: [userId], references: [id])
+  userId Int
+  post   Post @relation(fields: [postId], references: [id])
+  postId Int
+
+  @@id([userId, postId])
+}

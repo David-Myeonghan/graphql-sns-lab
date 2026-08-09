@@ -3,5 +3,5 @@ dist/
 *.db
 *.db-journal
 .env
-src/generated/
+**/src/generated/
 .superpowers/
