@@ -17,6 +17,7 @@
     "@pothos/plugin-prisma": "^4.15.0",
     "@prisma/adapter-better-sqlite3": "^7.9.1",
     "@prisma/client": "^7.9.1",
+    "dataloader": "^2.2.3",
     "graphql": "16.14.2",
     "graphql-yoga": "^5.21.2"
   },

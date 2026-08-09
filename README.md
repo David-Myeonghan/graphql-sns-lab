@@ -73,3 +73,65 @@ network 호출 횟수(계측값)와 응답 바디로 확인한 사실:
 - `invalidateAll()`처럼 전체를 날리는 방식은 안 지워도 될 캐시까지 날려 다시 로딩 스피너가 뜬다(성능 이점 상실)
 
 이게 P5에서 Apollo `InMemoryCache`(정규화 캐시, 엔티티 단위 자동 무효화)로 갈아타는 이유다.
+
+## Phase 3 실측
+
+측정 쿼리 (`server/src/context.ts`의 `prisma.$on('query', ...)`로 SQL 카운트를 콘솔에 `[SQL n]`으로 찍음):
+```bash
+curl -s localhost:4000/graphql -H 'content-type: application/json' \
+  -d '{"query":"query{ post(id: 1){ comments { body author { name } } } }"}'
+```
+post id 1은 시드 데이터상 댓글 3개(작성자 Ava/Ben/Cho, 전부 다른 유저).
+
+### 실측값
+
+| 단계 | SQL 개수 | 로그 |
+|---|---|---|
+| Before (N+1 재현) | **5** | `[SQL 1]` Post, `[SQL 2]` Comment, `[SQL 3~5]` User × 3 (댓글당 1회) |
+| After (DataLoader 적용) | **3** | `[SQL 1]` Post, `[SQL 2]` Comment, `[SQL 3]` User(`WHERE id IN (...)` 1회로 배칭) |
+
+두 번 모두 서버를 껐다 켜서(카운터 리셋) 같은 curl 1회로 잰 값 — 재실행해도 동일하게 재현된다.
+
+### 두 겹이었던 "숨은 배칭" (계획에 없던 실측 편차)
+
+브리프의 Step 1은 "`Comment.author`를 `t.relation('author')` 그대로 두면 Pothos-Prisma가 이미 JOIN/IN으로
+합칠 수 있으니, N+1이 안 보이면 naive resolver(`findUniqueOrThrow`)로 바꿔 재현하라"고 했다. 실측해보니
+실제로는 **두 겹**이었다:
+
+1. **`t.relation('author')` 그대로**: 3 SQL (N+1 없음) — Pothos-Prisma 플러그인이 부모 `post` 리졸버의
+   `query` 인자를 타고 내려가 `comments.author`까지 하나의 `include` 트리로 묶어 배칭.
+2. **브리프 그대로 `findUniqueOrThrow`로 naive resolver 교체**: 여전히 3 SQL (N+1 재현 실패!) —
+   Prisma Client 자체가 같은 tick 안의 `findUnique`/`findUniqueOrThrow` 호출들을 자동으로
+   `WHERE id IN (...)` 1방에 배칭하는 내장 dataloader를 갖고 있다(공식 문서
+   [Query optimization — Solving the n+1 problem](https://www.prisma.io/docs/orm/prisma-client/queries/query-optimization-performance)에
+   명시, `findUnique` 계열 한정). WebSearch로 이 문서를 확인하고, 직접 `findUniqueOrThrow` vs
+   `findFirst`로 바꿔가며 SQL 개수를 실측해 대조했다.
+3. **`findFirst`로 교체(이 최적화 대상 아님)**: 비로소 5 SQL — 진짜 N+1 재현.
+
+즉 브리프의 naive resolver 예시(`findUniqueOrThrow`)만으로는 이 Prisma 버전(7.9.1)에서 N+1이 재현되지
+않는다 — Pothos 레이어와 Prisma Client 레이어가 각각 배칭을 하고 있어서다. `server/src/schema.ts`의
+`Comment.author` 필드 주석(LEARN 편차 1/2)에 이 경위를 남겨뒀다.
+
+### RED → GREEN
+
+`server/test/dataloader.test.ts` ("SQL 3회 이하로 끝난다") 최초 실행 (구현 전, `findFirst` naive resolver
+상태):
+```
+FAIL  test/dataloader.test.ts > DataLoader batching > post 1개의 comments{author}가 SQL 3회 이하로 끝난다 (post + comments + batched users)
+AssertionError: expected 5 to be less than or equal to 3
+ ❯ test/dataloader.test.ts:15:24
+```
+`context.ts`에 `createLoaders()`(DataLoader) 추가 + `schema.ts`의 `Comment.author`를
+`ctx.loaders.user.load(c.authorId)`로 교체 후 재실행:
+```
+Test Files  2 passed (2)
+     Tests  2 passed (2)
+```
+(`feed.test.ts` + `dataloader.test.ts` 둘 다 통과, 3회 연속 재실행으로 안정성 확인 — 두 테스트 파일이
+같은 모듈 레벨 `queryCount`를 import하지만 Vitest가 파일마다 독립된 모듈 그래프로 격리 실행해서
+간섭이 없었다. 별도 vitest 설정 변경은 불필요했다.)
+
+DataLoader가 하는 일: 같은 tick 안에서 호출된 `.load(authorId)` 3번(Ava/Ben/Cho)을 모아
+`prisma.user.findMany({ where: { id: { in: [...] } } })` 1번으로 합친다 — Prisma Client의
+`findUnique` 자동배칭이 놓친 지점(우리는 `findFirst`로 우회해서 그 배칭 밖에 있었다)을 GraphQL
+리졸버 레벨에서 우리가 직접 재구현한 것.

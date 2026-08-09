@@ -2,7 +2,7 @@ import { builder } from './builder';
 
 // 📚 LEARN(P1): code-first — TS 코드가 곧 스키마. GraphiQL 문서 탭에서 이 정의가
 // 그대로 "살아있는 API 문서"로 렌더되는 것을 볼 것.
-builder.prismaObject('User', {
+const userRef = builder.prismaObject('User', {
   fields: (t) => ({
     id: t.exposeInt('id'),
     name: t.exposeString('name'),
@@ -14,7 +14,24 @@ builder.prismaObject('Comment', {
   fields: (t) => ({
     id: t.exposeInt('id'),
     body: t.exposeString('body'),
-    author: t.relation('author'), // 📚 LEARN(P3): 이 relation이 N+1의 진원지가 된다
+    // 📚 LEARN(P3) 편차 1: 원래 여기 있던 t.relation('author')는 N+1이 아니었다 — Pothos-Prisma
+    // 플러그인이 부모 prismaField의 query 인자를 타고 내려가 관계를 자동으로 IN 배칭한다(실측:
+    // post+comments+users 단 3개 SQL). N+1을 실제로 보려면 GraphQL 필드 리졸버가 그 최적화
+    // 경로를 벗어나 "제 발로" DB를 때리는 naive resolver여야 한다.
+    //
+    // 📚 LEARN(P3) 편차 2: 브리프 그대로 findUniqueOrThrow로 naive resolver를 짜도(재현
+    // 과정에서 실측) 여전히 3개 SQL이었다 — Prisma Client 자체가 같은 tick의 findUnique/
+    // findUniqueOrThrow 호출들을 `WHERE id IN (...)` 1방으로 자동 배칭하는 내장 dataloader를
+    // 갖고 있기 때문(공식 문서: "Solving the n+1 problem" 섹션, findUnique 계열 한정). 그
+    // 최적화 대상이 아닌 findFirst로 바꾸고 나서야 진짜 N+1(실측 5 SQL = post 1 + comments 1
+    // + user 3)이 드러났다 — Pothos 레이어, Prisma Client 레이어가 각각 배칭을 하고 있었던 것.
+    //
+    // 아래 ctx.loaders.user.load()가 그 배칭을 GraphQL 리졸버 레벨에서 우리가 직접
+    // 재구현한 최종 처방(DataLoader) — context.ts의 createLoaders 참조.
+    author: t.field({
+      type: userRef,
+      resolve: (c, _args, ctx) => ctx.loaders.user.load(c.authorId),
+    }),
   }),
 });
 
