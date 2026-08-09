@@ -311,3 +311,122 @@ pnpm --filter server seed
 ### 질문 1 (React Query와의 차이)
 
 > ✍️ 여기에 내 답을 쓴다:
+
+## Phase 6 체감 기록
+
+이 커밋의 diff 핵심: `schema.ts`의 `feed`가 `t.prismaField(['Post'])`(리스트) → `t.prismaConnection(...)`
+(edges/pageInfo)으로, `apollo.ts`의 캐시 정책에 `relayStylePagination()`이 추가되고, `Feed.tsx`가
+`fetchMore` + `IntersectionObserver`로 무한스크롤을 구현.
+
+### 왜 offset이 아니라 cursor인가
+
+offset(`skip: 20, take: 10`)은 스크롤 도중 새 글이 위에 삽입되면 다음 페이지 요청의 skip 기준이 밀려
+항목이 중복되거나 누락된다. cursor는 "이 항목(id) 다음부터"를 의미해 삽입/삭제에 영향받지 않는다.
+Pothos `cursor: 'id'`는 이 id를 base64로 인코딩한 opaque 커서로 노출한다(아래 실측 참조).
+
+### RED → GREEN (`feed.test.ts`)
+
+TDD로 테스트를 먼저 커넥션 형태로 갱신하고(서버는 아직 리스트 반환) 실행 — RED:
+```
+Unknown argument "first" on field "Query.feed".
+Cannot query field "edges" on type "Post".
+Cannot query field "pageInfo" on type "Post".
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 1 passed (2)
+```
+`builder.ts`에 RelayPlugin 추가 + `schema.ts`의 `feed`를 `t.prismaConnection`으로 교체 후 재실행 — GREEN:
+```
+ Test Files  2 passed (2)
+      Tests  2 passed (2)
+```
+
+### 편차 확인: RelayPlugin 옵션 shape (편차 없음)
+
+브리프의 `relay: {}`를 그대로 신뢰하지 않고 설치된 `@pothos/plugin-relay@4.7.1`의 d.ts
+(`dts/global-types.d.ts`, `dts/types.d.ts`)를 확인했다. `RelayPluginOptions<Types>`에는
+`nodeTypeOptions`/`pageInfoTypeOptions`/`nodeQueryOptions` 등 얼핏 필수처럼 보이는 필드가 여럿
+있지만, 전체가 `@pothos/core`의 `EmptyToOptional<T>` 유틸리티 타입으로 감싸여 있다 — 이 필드들의
+타입이 전부 `Omit<...선택적 프로퍼티...>` 형태라 구조적으로 `{}`와 호환되고, `EmptyToOptional`이
+그런 키를 전부 옵셔널로 접는다. 그 결과 `relay: {}`가 타입상 유효하다 — `tsc --noEmit` 통과로 확인.
+**편차 없음.**
+
+`t.prismaConnection`도 `@pothos/plugin-prisma`의 `global-types.d.ts`에서
+`'relay' extends PluginName ? ... : never`라는 조건부 타입으로 선언돼 있다 — `plugins:
+[PrismaPlugin, RelayPlugin]`에 RelayPlugin이 없으면 이 필드 자체가 타입에서 사라진다.
+
+### armor maxDepth 재검증 (편차 없음 — 여전히 n:6 아래)
+
+P4에서 넣은 `EnvelopArmorPlugin({ maxDepth: { n: 6 } })`이 이번에 깊어진 쿼리
+(`feed → edges → node → author → name`)를 막는지 재검증했다. armor의 depth 카운팅 규칙
+(OperationDefinition=depth 0, `selectionSet` 진입마다 +1, P4 README에 기록)으로 손계산하면:
+
+```
+{ feed(first:10, after:$after) {                     ← 진입1(연산) → 진입2(feed)
+  edges { node { id body author { name } } }         ← 진입3(edges) → 진입4(node) → 진입5(author)
+  pageInfo { hasNextPage endCursor }
+} }
+```
+최대 depth 5, `n: 6` 아래라 영향 없음 — 아래 curl 실측도 200 + 정상 `data`로 확인. **n 상향 조정 불필요.**
+
+### 헤드리스 페이지네이션 실측 (실제 커서 값)
+
+서버(`pnpm --filter server dev`, 4000) + 웹(`pnpm --filter web dev`, 5173, Vite 프록시
+`/graphql`→4000) 기동 후 curl로 직결 — DB는 시드 상태 그대로(Post 30개, id 1~30, `createdAt`이
+id가 클수록 과거라 `ORDER BY createdAt DESC`가 id 오름차순과 일치):
+
+**1페이지** (`first: 10`, `after` 없음):
+```
+edges: id 1~10 (author Ava/Ben/Cho 순환)
+pageInfo: { hasNextPage: true, endCursor: "R1BDOk46MTA=" }
+```
+`R1BDOk46MTA=`를 base64 디코드하면 `GPC:N:10` — Pothos가 cursor 필드(`id`) 값을 이런 형태로
+인코딩해 opaque하게 감춘다(클라이언트는 값을 파싱하지 않고 그대로 다음 요청의 `after`에 넣기만 하면 됨).
+
+**2페이지** (`after: "R1BDOk46MTA="`, 1페이지의 endCursor 그대로):
+```
+edges: id 11~20 (1페이지와 겹침 없음)
+pageInfo: { hasNextPage: true, endCursor: "R1BDOk46MjA=" }
+```
+
+**3페이지** (`after: "R1BDOk46MjA="`):
+```
+edges: id 21~30 (마지막 페이지, 1·2페이지와 겹침 없음)
+pageInfo: { hasNextPage: false, endCursor: "R1BDOk46MzA=" }
+```
+
+30개 시드 데이터를 정확히 3페이지(10+10+10)로 소진하고 `hasNextPage: false`로 끝나는 것을 실측으로
+확인 — 브리프의 "30개까지 이어붙음"과 일치. 세 페이지 사이 id 겹침이 전혀 없어 cursor 기반 페이지네이션이
+의도대로 동작함을 확인했다(curl은 raw HTTP라 Apollo 캐시를 거치지 않는다 — "서버가 cursor 규약을
+정확히 따른다"만 증명하고, "클라 merge가 자동으로 이어붙는다"는 클라이언트 사실이라 아래 수동
+절차로 별도 확인).
+
+### 편차 확인: `relayStylePagination` import 경로 (편차 없음)
+
+설치된 `@apollo/client@4.2.10`의 `utilities/index.d.ts`에 `export { concatPagination,
+offsetLimitPagination, relayStylePagination } from './policies/pagination.js'`로 명시돼 있어
+브리프의 `@apollo/client/utilities` 경로가 정확했다. **편차 없음.**
+
+### `Feed.tsx`: 기존 에러 가드와 병합
+
+브리프 원문 코드는 `loading`/`error` 가드가 없었지만, 이 파일은 이미 리뷰 피드백으로 `error` 분기
+(옵셔널 체이닝 대신 명시적 가드)가 들어가 있던 상태였다. 두 요구를 합쳐 `const { data, loading,
+error, fetchMore } = useQuery(...)`로 구조분해하고, `if (loading && !data) → if (error) → 정상 렌더`
+순서를 유지했다. `loading && !data` 가드는 브리프 그대로 — Apollo 기본값(`notifyOnNetworkStatusChange:
+false`)에서는 `fetchMore` 중에 `loading`이 다시 true가 되지 않지만, 이 가드가 혹시 모를 재조회
+시나리오에서 이미 그려진 목록이 "loading…"으로 깜빡이는 걸 막는 방어선이 된다.
+
+### 수동 재현 절차 — 브라우저 무한스크롤 (미실행, 헤드리스 환경 한계)
+
+에이전트는 브라우저를 조작하지 않았다 — IntersectionObserver 트리거와 실제 스크롤 UX는 브라우저
+없이는 관찰 불가능하다. David가 직접 확인할 절차:
+
+1. `pnpm dev:server` + `pnpm dev:web` 후 `http://localhost:5173` 접속, 피드 탭
+2. 개발자도구 Network 탭 필터를 `graphql`로 걸어둔다
+3. 목록을 아래로 스크롤 — sentinel(`<div ref={sentinel}>`)이 뷰포트에 들어올 때마다 Network 탭에
+   `after` 변수가 실린 POST 요청이 순차로 나가는지 확인 (1회차는 `after` 없음, 2회차부터 직전
+   응답의 `endCursor`가 그대로 실림 — 위 헤드리스 실측 값과 동일한 패턴)
+4. 목록이 30개(post #0~#29)까지 이어붙는지, 30개에 도달한 후 더 스크롤해도 추가 요청이 나가지
+   않는지(`pageInfo.hasNextPage: false`가 되어 `useEffect`가 observer를 다시 안 다는 상태) 확인
+5. Apollo Client Devtools "Cache" 탭에서 `ROOT_QUERY.feed` 엔트리를 열어 `edges` 배열이 fetchMore
+   이후에도 하나로 이어붙어 있는지(손으로 짠 merge 코드 없이) 확인

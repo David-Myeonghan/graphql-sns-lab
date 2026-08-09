@@ -52,10 +52,14 @@ builder.prismaObject('Post', {
 
 builder.queryType({
   fields: (t) => ({
-    feed: t.prismaField({
-      type: ['Post'],
+    // 📚 LEARN(P6): Relay Connection 스펙 — edges/cursor/pageInfo를 서버가 따르는 이유는
+    // offset이 못 푸는 문제(스크롤 중 새 글 삽입 시 중복/누락) 때문. 커서 = "이 항목 다음부터".
+    feed: t.prismaConnection({
+      type: 'Post',
+      cursor: 'id',
+      defaultSize: 10,
       resolve: (query, _root, _args, ctx) =>
-        ctx.prisma.post.findMany({ ...query, orderBy: { createdAt: 'desc' }, take: 20 }),
+        ctx.prisma.post.findMany({ ...query, orderBy: { createdAt: 'desc' } }),
     }),
     post: t.prismaField({
       type: 'Post',

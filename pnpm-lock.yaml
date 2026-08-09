@@ -19,6 +19,9 @@ importers:
       '@pothos/plugin-prisma':
         specifier: ^4.15.0
         version: 4.15.0(@pothos/core@4.13.1(graphql@16.14.2))(@prisma/client@7.9.1(prisma@7.9.1(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(better-sqlite3@12.11.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3))(typescript@5.9.3))(graphql@16.14.2)
+      '@pothos/plugin-relay':
+        specifier: ^4.7.1
+        version: 4.7.1(@pothos/core@4.13.1(graphql@16.14.2))(graphql@16.14.2)
       '@prisma/adapter-better-sqlite3':
         specifier: ^7.9.1
         version: 7.9.1
@@ -397,6 +400,12 @@ packages:
     peerDependencies:
       '@pothos/core': '*'
       '@prisma/client': '*'
+      graphql: ^16.10.0 || ^17.0.0
+
+  '@pothos/plugin-relay@4.7.1':
+    resolution: {integrity: sha512-aj0xgdcvktx0k6iOvtkfJvb6FYdoWnlQkDMumr1WQm7uTXsJOASYQndytfnS0/0wsctCF/UTTK6Y53+F0UIeMw==}
+    peerDependencies:
+      '@pothos/core': '*'
       graphql: ^16.10.0 || ^17.0.0
 
   '@prisma/adapter-better-sqlite3@7.9.1':
@@ -1842,6 +1851,11 @@ snapshots:
       '@pothos/core': 4.13.1(graphql@16.14.2)
       '@prisma/client': 7.9.1(prisma@7.9.1(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(better-sqlite3@12.11.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3))(typescript@5.9.3)
       '@prisma/generator-helper': 7.9.1
+      graphql: 16.14.2
+
+  '@pothos/plugin-relay@4.7.1(@pothos/core@4.13.1(graphql@16.14.2))(graphql@16.14.2)':
+    dependencies:
+      '@pothos/core': 4.13.1(graphql@16.14.2)
       graphql: 16.14.2
 
   '@prisma/adapter-better-sqlite3@7.9.1':
