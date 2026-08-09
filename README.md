@@ -529,3 +529,82 @@ P7은 여기에 `optimisticResponse`를 얹은 것 — 정규화 자동 갱신�
    녹화(선택) 또는 눈으로 왕복 확인 후 `FAIL_LIKES` 없이 서버 재기동
 3. 확인 후 DB는 헤드리스 실측 단계에서 이미 시드 상태(15행, 전부 Ben)로 복원해뒀다 — 수동 절차
    중 실수로 좋아요를 눌러 상태가 바뀌었다면 같은 버튼을 한 번 더 눌러 원상복구할 것
+
+## 학습 지도
+
+옵시디언 "GraphQL 클라이언트 (Relay·Apollo·urql) 학습 질문 설계" 노트 §3의 질문 9개 번호를 기준으로
+Phase를 매핑한다. 각 행의 "체감 재현 방법"은 위 Phase별 "체감 기록/실측" 절 이름을 그대로 가리키므로,
+숫자·로그를 다시 옮기지 않고 해당 절로 점프해서 읽는다.
+
+| Phase | checkout | 핵심 파일 | 여기서 배우는 것 | 체감 재현 방법 | 면접 질문 매핑 |
+|---|---|---|---|---|---|
+| 1 | `git checkout phase-1` | `server/src/schema.ts`, `server/src/context.ts`, `server/prisma/schema.prisma` | code-first 스키마 = 살아있는 문서, 클라이언트가 응답 모양을 결정 | "Phase 1 체감 기록" — GraphiQL 자동완성 + curl 필드 조합 실측 | 질문 9 (서버는? — Yoga+Pothos 조합 그 자체가 답) |
+| 2 | `git checkout phase-2` | `web/src/gqlFetch.ts`, `web/src/screens/Profile.tsx` | 쿼리 문자열 키 캐시의 stale 함정 — "이 mutation이 어떤 쿼리를 무효화하나"를 사람이 추적하는 부서짐 | "Phase 2 체감 기록" — 헤드리스 fetch 호출 카운트 6단계 로그 + 수동 재현 절차 | 질문 1 (정규화 캐시가 왜 필요한지, 반례로 먼저 겪음) · 질문 4 (`invalidateAll()` = 3가지 갱신 전략 중 refetch류) |
+| 3 | `git checkout phase-3` | `server/src/context.ts`(`createLoaders`), `server/src/schema.ts`(`Comment.author`) | N+1과 DataLoader 배칭, Prisma Client 자체 배칭과의 이중 레이어 | "Phase 3 실측" — SQL 카운트 표(5→3) + RED→GREEN 테스트 로그 | 해당 없음 — 9개 질문은 클라이언트 캐시 축이고 이건 서버 성능 축이다. 억지로 끼워 맞추지 않음(질문 5 "정규화 캐시 비용" 답변 때 "서버도 접근 패턴을 못 읽는 비용이 있다"는 대비 배경 정도로만 참고) |
+| 4 | `git checkout phase-4` | `server/src/main.ts`(`EnvelopArmorPlugin`), `server/src/schema.ts`(`userRef.posts`) | 쿼리 폭탄·introspection이 REST엔 없던 공격 표면인 이유, SQL 카운트만으론 못 잡는 응답 크기 폭증 | "Phase 4 실측" — before/after 표(377KB→82byte, SQL 11개, depth 8 에러) | 질문 7과 인접(정확히 같은 개념 아님) — persisted queries는 화이트리스트 방식, 이 레포가 실측한 armor depth-limit은 다른 메커니즘. 질문 7 답변 시 "우리 레포는 depth-limit으로 겪었고 persisted query는 다른 해법"이라고 구분해서 답할 것 |
+| 5 ★ | `git checkout phase-5` | `web/src/apollo.ts`, `web/src/screens/Profile.tsx`, `web/src/screens/Feed.tsx` | 정규화 캐시 자동 갱신, `id` 누락 시 정규화 자체가 안 되어 stale이 재발하는 실패 모드 | "Phase 5 체감 기록 ★클라이맥스" — P2 vs P5 비교표 + 수동 재현 절차(3) | 질문 1 (핵심 — **자기 답변 칸은 이 절 안 "질문 1 (React Query와의 차이)" 아래 `✍️` 표시, README 313행**) · 질문 4 (정규화 자동 갱신) · 질문 5 (`author { id name }`에서 `id` 빠뜨리면 partial data 실패 실측) |
+| 6 | `git checkout phase-6` | `server/src/schema.ts`(`t.prismaConnection`), `web/src/apollo.ts`(`relayStylePagination`), `web/src/screens/Feed.tsx` | offset이 아닌 cursor인 이유, Relay Connection 스펙(edges/cursor/pageInfo) | "Phase 6 체감 기록" — 3페이지 커서 실측(id 겹침 없음) + 수동 무한스크롤 절차 | 질문 6 (Relay가 서버에 Connection 스펙을 강제하는 이유) |
+| 7 | `git checkout phase-7` | `web/src/screens/Feed.tsx`(`optimisticResponse`), `server/src/schema.ts`(`toggleLike`) | optimistic update + 실패 시 자동 롤백 | "Phase 7 체감 기록" — 성공/실패 경로 헤드리스 실측 + 수동 절차 | 질문 4 (mutation 갱신 전략 3가지를 이 레포 어디서 겪었는지 종합한 표 — README 502행 근처) |
+
+### 코드 phase가 없는 질문 3개 — 정직하게 빈칸으로 남김
+
+9개 질문 중 3개는 특정 Phase 코드에 대응시키지 않았다. 억지로 표에 욱여넣지 않고 왜 비는지를 남긴다:
+
+- **질문 2** (fragment colocation이 컴포넌트 아키텍처를 왜 바꾸나) — 이건 Relay 전용 개념이라 Phase 8(Relay 재작성)에서만 코드로 체감된다. Phase 8은 학습 계획 노트에 "선택"으로 적혀 있었고 이번 학습 범위에서 제외하기로 결정했다(Task 9 self-review 기록) — 이 레포엔 Relay 코드가 없다. 답은 개념으로만 준비해야 한다.
+- **질문 3** (GraphQL이 오히려 나쁜 선택인 경우) · **질문 8** (뭘로 시작할까) — 특정 Phase가 아니라 학습 계획 노트의 "마무리 — 면접 리허설" 단계에서 프로젝트 전체를 돌아보며 종합적으로 답하는 질문이다. 계획 노트 자체가 질문 3에 대해 "이 앱조차 단일 클라이언트라 실무라면 REST+TanStack Query로 충분했다는 것까지 말할 수 있으면 완성"이라고 못 박아뒀다 — 이 리허설은 David 본인 몫.
+
+**질문 8 관련 계획 대비 diff**: 계획 노트는 "개념을 빨리 훑고 싶으면 urql + Graphcache"를 추천했지만, 이 레포의 Phase 5~7은 실제로 **Apollo Client**(`InMemoryCache`)로 구현됐다(Task 5 결정). 질문 8에 답할 때 "왜 urql 대신 Apollo를 선택했나"까지 붙이면 더 단단해진다 — 두 정규화 캐시 클라이언트를 코드로 비교해본 게 이 레포의 실물 재료다.
+
+### 도메인 모델 diff (계획 대비)
+
+학습 계획 노트의 도메인 모델은 `User`/`Post`/`Comment`/`Follow` 4개였지만, 이 레포엔 `Follow`가 없다.
+7개 Phase 중 어느 것도 팔로우 관계를 쿼리하지 않아서(피드는 전체 공개, 팔로잉 필터 없음) Task 2에서
+YAGNI로 제외했다 — 안 쓸 모델을 미리 만들어두지 않는다는 원칙 그대로다.
+
+### 📚 LEARN 마커 인덱스
+
+`git grep -n "📚 LEARN"` 실행 결과(2026-08-09 기준, phase-7 = HEAD)를 그대로 남긴다. 코드를 보다가
+"왜 이렇게 짰지"가 궁금하면 이 목록에서 파일:줄로 바로 찾아간다:
+
+```
+server/prisma.config.ts:3:// 📚 LEARN(P1): Prisma 7 — datasource url은 더 이상 schema.prisma에 쓸 수 없다.
+server/prisma/schema.prisma:8:  // 📚 LEARN(P1) 편차: clientOutput은 이 pothos 출력 파일(위 output) 자신의 위치를 기준으로 한
+server/prisma/seed.ts:4:// 📚 LEARN(P1) 편차: Prisma 7은 Rust 엔진을 뺐다 — url만으로 접속 불가, driver adapter 필수.
+server/src/builder.ts:13:  // 📚 LEARN(P6): plugin-prisma의 `t.prismaConnection`은 제네릭 조건부 타입
+server/src/context.ts:5:// 📚 LEARN(P1): GraphQL 서버의 "요청당 컨텍스트" — 인증·DB 핸들이 리졸버로 흐르는 통로.
+server/src/context.ts:8:// 📚 LEARN(P1) 편차: Prisma 7은 Rust 엔진을 뺐다 — schema.prisma의 url만으로는 접속 불가,
+server/src/context.ts:13:// 📚 LEARN(P3): 쿼리 카운터 — N+1을 눈으로 보기 위한 계측
+server/src/context.ts:23:// 📚 LEARN(P3): DataLoader — 같은 tick 안의 .load(id)들을 모아 IN 쿼리 1방으로.
+server/src/context.ts:34:    // 📚 LEARN(P7): P3와 같은 패턴 — 피드 10개의 likedByMe도 IN 1방으로.
+server/src/context.ts:53:  // 📚 LEARN(P3): loader는 요청마다 새로 만든다 — 요청 간 캐시 공유는 stale/권한 누수
+server/src/main.ts:10:  // 📚 LEARN(P4): REST엔 없던 공격 표면 — 클라이언트가 쿼리 모양을 정하는 대가.
+server/src/schema.ts:3:// 📚 LEARN(P1): code-first — TS 코드가 곧 스키마. GraphiQL 문서 탭에서 이 정의가
+server/src/schema.ts:10:    // 📚 LEARN(P4): 그래프를 넓히면 공격 표면도 넓어진다 — 이 한 줄이 생기기 전까진
+server/src/schema.ts:22:    // 📚 LEARN(P3) 편차 1: 원래 여기 있던 t.relation('author')는 N+1이 아니었다 — Pothos-Prisma
+server/src/schema.ts:27:    // 📚 LEARN(P3) 편차 2: 브리프 그대로 findUniqueOrThrow로 naive resolver를 짜도(재현
+server/src/schema.ts:57:    // 📚 LEARN(P6): Relay Connection 스펙 — edges/cursor/pageInfo를 서버가 따르는 이유는
+server/src/schema.ts:94:        // 📚 LEARN(P7): 실패 롤백 실험용 스위치 — FAIL_LIKES=1 pnpm dev 로 켠다
+web/src/apollo.ts:4:// 📚 LEARN(P5): InMemoryCache는 정규화 캐시 — 응답을 해체해 "User:1" 같은
+web/src/apollo.ts:13:          // 📚 LEARN(P6): fetchMore로 받은 다음 페이지를 기존 edges 뒤에 이어붙이는 merge 정책.
+web/src/screens/Feed.tsx:5:// 📚 LEARN(P6): feed가 리스트가 아니라 Connection(edges/pageInfo)을 반환하도록 바뀜.
+web/src/screens/Feed.tsx:13:// 📚 LEARN(P5): author에 id를 반드시 포함 — 정규화 캐시는 __typename+id로
+web/src/screens/Feed.tsx:20:// 📚 LEARN(P5) 편차 (P6에도 유효): 브리프는 useQuery(FEED)를 무인자로 썼지만, Apollo Client 4의
+web/src/screens/Feed.tsx:40:// 📚 LEARN(P7): optimisticResponse는 Unmasked<TData>와 정확히 같은 shape을 요구한다 —
+web/src/screens/Feed.tsx:54:  // 📚 LEARN(P6): IntersectionObserver로 sentinel div가 화면에 들어오면 다음 페이지 요청.
+web/src/screens/Feed.tsx:79:                  // 📚 LEARN(P7): 서버 응답 전에 "예상 응답"을 캐시에 먼저 반영 → 클릭 즉시 하트.
+web/src/screens/PostDetail.tsx:9:// 📚 LEARN(P5): Feed.tsx와 동일한 이유로 author에 id 포함 — 정규화 캐시가
+web/src/screens/PostDetail.tsx:12:// 📚 LEARN(P5) 편차: Feed.tsx/Profile.tsx와 같은 이유(useQuery 기본 TData=unknown).
+web/src/screens/Profile.tsx:8:// 📚 LEARN(P5) 편차: Feed.tsx와 같은 이유(useQuery 기본 TData=unknown) — 인라인
+web/src/screens/Profile.tsx:18:  // 📚 LEARN(P5): invalidateAll도 refetch도 없다. mutation 응답에 id+name이 있으니
+```
+
+### David의 숙제 — 에이전트가 실행하지 않은 수동 절차
+
+헤드리스 환경(브라우저 없음)이라 아래는 코드·서버 로그로 대신 확인했을 뿐 실제로 브라우저에서
+누르고 본 적이 없다. 위 표의 "체감 재현 방법"을 따라가다 이 절차들에 도달하면 직접 해야 한다:
+
+- **Phase 2**: "재현 절차 (수동)" 5단계 — 피드/프로필 탭 왕복, Map 캐시 stale 눈으로 확인
+- **Phase 5**: "수동 재현 절차 (3)" 8단계 — Apollo Devtools Cache 탭에서 `User:1` 엔티티가 실시간으로 바뀌는 것, refetch 없이 피드가 재렌더되는 것
+- **Phase 6**: "수동 재현 절차 — 브라우저 무한스크롤" 5단계 — IntersectionObserver 트리거, Network 탭에서 `after` 커서가 실리는 것
+- **Phase 7**: "수동 재현 절차 — 낙관적 반응 + 자동 롤백" 3단계 — 클릭 즉시 하트 반영, 서버 에러 시 자동 원복
+- **마무리**: 질문 9개 전부에 대해 이 프로젝트 사례를 근거로 소리 내어 답하기 (질문 1은 README 313행에 직접 서면으로도 남길 것)
