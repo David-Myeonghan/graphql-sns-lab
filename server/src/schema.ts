@@ -51,4 +51,15 @@ builder.queryType({
   }),
 });
 
+builder.mutationType({
+  fields: (t) => ({
+    updateMyName: t.prismaField({
+      type: 'User',
+      args: { name: t.arg.string({ required: true }) },
+      resolve: (query, _root, args, ctx) =>
+        ctx.prisma.user.update({ ...query, where: { id: ctx.userId }, data: { name: args.name } }),
+    }),
+  }),
+});
+
 export const schema = builder.toSchema();
