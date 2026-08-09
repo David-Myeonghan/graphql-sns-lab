@@ -7,6 +7,11 @@ const userRef = builder.prismaObject('User', {
     id: t.exposeInt('id'),
     name: t.exposeString('name'),
     avatarUrl: t.exposeString('avatarUrl'),
+    // 📚 LEARN(P4): 그래프를 넓히면 공격 표면도 넓어진다 — 이 한 줄이 생기기 전까진
+    // `feed { comments { author { X } } }` 이상으로 내려갈 곳이 없었다. author.posts가
+    // 열리는 순간 posts→comments→author→posts→...로 임의 깊이 순환이 가능해진다
+    // (아래 P4 폭탄 쿼리가 이 필드 하나에 의존).
+    posts: t.relation('posts'),
   }),
 });
 

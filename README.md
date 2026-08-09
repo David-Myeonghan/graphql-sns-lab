@@ -135,3 +135,74 @@ DataLoader가 하는 일: 같은 tick 안에서 호출된 `.load(authorId)` 3번
 `prisma.user.findMany({ where: { id: { in: [...] } } })` 1번으로 합친다 — Prisma Client의
 `findUnique` 자동배칭이 놓친 지점(우리는 `findFirst`로 우회해서 그 배칭 밖에 있었다)을 GraphQL
 리졸버 레벨에서 우리가 직접 재구현한 것.
+
+## Phase 4 실측
+
+측정 쿼리 (서버 켠 상태로 curl):
+```bash
+curl -s localhost:4000/graphql -H 'content-type: application/json' \
+  -d '{"query":"{ feed { comments { author { posts { comments { author { posts { id } } } } } } } }"}'
+```
+이 쿼리가 가능하려면 먼저 `schema.ts`의 `userRef`에 `posts: t.relation('posts')`를 추가해야 했다 —
+`author.posts`가 없으면 posts→comments→author→posts로 순환할 곳이 아예 없다. 그래프를 한 줄
+넓히자마자 공격 표면도 함께 넓어진 셈(`schema.ts`의 LEARN 주석 참조).
+
+### Before armor (실측)
+
+| 항목 | 값 |
+|---|---|
+| HTTP | 200 |
+| 응답 크기 | 377,586 bytes (약 369KB) |
+| SQL 카운트 | **11** (`context.ts`의 `[SQL n]` 로그) |
+
+SQL 로그:
+```
+[SQL 1]  SELECT ... Post ...
+[SQL 2]  SELECT ... Comment ...
+[SQL 3]  SELECT ... User ...
+[SQL 4]  SELECT ... User ...
+[SQL 5]  SELECT ... Post ...
+[SQL 6]  SELECT ... Comment ...
+[SQL 7]  SELECT ... User ...
+[SQL 8]  SELECT ... Post ...
+[SQL 9]  SELECT ... Comment ...
+[SQL 10] SELECT ... User ...
+[SQL 11] SELECT ... Post ...
+```
+
+**계획에 없던 실측 발견**: 이 쿼리는 depth 8까지 내려가는데도 SQL은 겨우 11개다 — naive N+1처럼
+폭증하지 않는다. P3에서 확인한 Pothos-Prisma의 query-arg 배칭이 depth가 깊어져도 레벨마다 계속
+동작해서(posts→comments→author→posts→comments→author 패턴이 반복되며 레벨당 쿼리 1~2개로
+수렴), SQL 카운트만 보면 "괜찮아 보이는" 착시가 생긴다. 실제 폭탄은 SQL이 아니라 **응답 크기**에서
+터진다 — feed의 포스트 20개 × 각 댓글 여러 개 × 각 작성자의 posts 여러 개가 fan-out하며 377KB까지
+불어난다. SQL 카운터 하나만 계측 지표로 삼으면 이 케이스를 놓친다는 걸 실측으로 직접 확인했다.
+
+### armor 옵션 shape 검증
+
+브리프의 `EnvelopArmorPlugin({ maxDepth: { n: 6 } })`을 그대로 신뢰하지 않고 설치된 패키지의 d.ts를
+따라갔다: `@escape.tech/graphql-armor`의 `index.d.ts` → `envelop/armor.d.ts`(`EnvelopArmorPlugin(config?:
+GraphQLArmorConfig)`) → `@escape.tech/graphql-armor-types`의 `GraphQLArmorConfig`(`maxDepth?:
+ProtectionConfiguration & MaxDepthOptions`) → `@escape.tech/graphql-armor-max-depth`의 `MaxDepthOptions`
+(`{ n?: number; ... }`, 기본값도 `n: 6`). 브리프의 shape이 실제 타입과 정확히 일치 — **옵션 shape
+자체는 편차 없음**.
+
+`maxDepth` 카운팅 알고리즘도 소스(`graphql-armor-max-depth`의 `countDepth`)로 직접 확인: 최상위
+`OperationDefinition`은 depth 0에서 시작하고, 이후 매 `selectionSet` 진입마다 +1. 이 규칙으로 기존
+테스트 쿼리의 depth를 손계산하면 `feed.test.ts`(`{ feed { id body author { name } } }`)는 3,
+`dataloader.test.ts`(`{ post(id:1) { comments { body author { name } } } }`)는 4 — 둘 다 `n: 6` 아래라
+영향 없을 것으로 예상됐고, `pnpm test` 재실행으로 실측 확인(2 test files, 2 tests 전부 green, n 상향
+조정 불필요).
+
+### After armor (실측)
+
+| 항목 | 값 |
+|---|---|
+| HTTP | 200 (편차 — 아래) |
+| 응답 바디 | `{"errors":[{"message":"Syntax Error: Query depth limit of 6 exceeded, found 8."}]}` |
+| 응답 크기 | 82 bytes, `data` 키 자체가 없음(`null`도 아님) |
+
+**편차(브리프 주석 vs 실측)**: 브리프 원문 주석은 "maxDepth 하나로 위 폭탄 쿼리가 400으로 죽는다"고
+적었지만, 실측 HTTP status는 **200**이다. GraphQL 스펙상 쿼리 검증(validation) 에러는 전송 계층
+(HTTP status)의 문제가 아니라 응답 바디의 `errors` 배열로 전달되는 것이 정상 동작이고, graphql-yoga가
+이 스펙을 그대로 따른다. `main.ts`의 주석을 이 실측대로 고쳐뒀다 — "400으로 죽는다"가 아니라 "죽되
+HTTP는 200, `data` 없이 `errors`만 온다"로.
