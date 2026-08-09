@@ -206,3 +206,108 @@ ProtectionConfiguration & MaxDepthOptions`) → `@escape.tech/graphql-armor-max-
 (HTTP status)의 문제가 아니라 응답 바디의 `errors` 배열로 전달되는 것이 정상 동작이고, graphql-yoga가
 이 스펙을 그대로 따른다. `main.ts`의 주석을 이 실측대로 고쳐뒀다 — "400으로 죽는다"가 아니라 "죽되
 HTTP는 200, `data` 없이 `errors`만 온다"로.
+
+## Phase 5 체감 기록 ★클라이맥스
+
+이 커밋의 diff 자체가 교재다: `gqlFetch.ts`(P2의 수제 Map 캐시)가 통째로 사라지고
+`apollo.ts`(`InMemoryCache`)가 그 자리를 대체한다. **P2 vs P5 비교**가 이 Phase의 핵심:
+
+| | P2 (`gqlFetch.ts`) | P5 (`apolloClient`) |
+|---|---|---|
+| 캐시 단위 | 쿼리 문자열 + variables (Map key) | 정규화된 엔티티 (`User:1`, `Post:3` …) |
+| mutation 후 갱신 | 사람이 `invalidateAll()`을 직접 호출해야 함 | mutation 응답에 `id`가 있으면 해당 엔티티가 자동 갱신 |
+| 화면이 늘어날 때 | "이 mutation이 어떤 쿼리를 무효화하는지" 매핑표를 손으로 관리 | 엔티티를 참조하는 모든 활성 쿼리가 자동으로 다시 그려짐 |
+| 실패 모드 | 빠뜨리면 컴파일 에러 없이 조용히 stale | `author { id name }`처럼 `id`를 빠뜨리면 정규화 자체가 안 돼 P2와 동일한 stale 재발 |
+
+### 임포트 분리 실측 (편차 없음)
+
+브리프의 임포트 분리 — `ApolloClient`/`InMemoryCache`/`HttpLink`/`gql`는 `@apollo/client`,
+`ApolloProvider`/`useQuery`/`useMutation`은 `@apollo/client/react` — 를 설치된
+`@apollo/client@4.2.10`의 d.ts로 직접 확인했다: `core/index.d.ts`가 앞의 4개를, `react/index.d.ts`가
+뒤의 3개를 정확히 그 분리로 export한다. **편차 없음.**
+
+### 편차: `useQuery`/`useMutation` 기본 `TData = unknown`
+
+브리프 코드를 그대로(`useQuery(FEED)` 무인자) 넣으면 `tsc`가 `data`를 `unknown`(옵셔널 체이닝을
+쓴 자리는 `{}`)으로 잡아 프로퍼티 접근이 전부 컴파일 에러가 난다. Apollo Client 4의
+`useQuery<TData = unknown, ...>` 시그니처가 원인 — plain `gql`은 `DocumentNode`일 뿐이라
+`TypedDocumentNode` 없이는 `data`의 모양을 추론할 수 없다. codegen은 이번 학습 범위 밖(YAGNI)이라
+화면마다 최소한의 인라인 타입 별칭(`FeedData`/`MeData`/`UpdateData`/`PostData`)을 만들어
+`useQuery<T>(...)`/`useMutation<T, V>(...)` 제네릭으로 넘기는 것으로 근본 해결했다(CLAUDE.md 원칙대로
+`as` 단언이 아니라 제네릭으로). `loading` 가드 이후에도 `data`는 `T | undefined`로 남아(별개
+프로퍼티라 control-flow narrowing이 안 됨) 브리프가 예고한 그대로 `data!`(Feed) 또는 기존에 이미
+있던 `data?.`(Profile/PostDetail)로 처리했다.
+
+### 헤드리스 실측 (1)(2) — 서버 상태 변화
+
+브라우저를 조작하지 않고, Vite 프록시(`http://localhost:5173/graphql`) 너머로 curl 직결:
+
+```
+$ curl -s :5173/graphql -d '{"query":"query Feed { feed { id body author { id name } } }"}'
+{"data":{"feed":[{"id":1,...,"author":{"id":1,"name":"Ava"}}, ...]}}   # (1) Ava 확인
+
+$ curl -s :5173/graphql -d '{"query":"query Me { me { id name } }"}'
+{"data":{"me":{"id":1,"name":"Ava"}}}                                   # mutation 전
+
+$ curl -s :5173/graphql -d '{"query":"mutation Update($name:String!){ updateMyName(name:$name){ id name } }","variables":{"name":"Ava2"}}'
+{"data":{"updateMyName":{"id":1,"name":"Ava2"}}}                        # (2) mutation 성공
+
+$ curl -s :5173/graphql -d '{"query":"query Me { me { id name } }"}'
+{"data":{"me":{"id":1,"name":"Ava2"}}}                                  # 서버 상태 실제로 바뀜
+```
+
+**주의**: 이 curl 왕복은 Apollo Client를 전혀 거치지 않은 raw HTTP다 — "서버가 mutation을 실제로
+반영했다"만 증명하고, 이 Phase의 진짜 주장("React가 refetch 없이 자동 재렌더된다")은 전혀 증명하지
+않는다. 그건 브라우저의 React 트리 + Apollo 캐시가 있어야만 관찰 가능한 사실이라 아래 (3)은 수동
+절차로만 남긴다.
+
+### 편차: `pnpm seed` 재실행이 "시드 상태"를 복원하지 않음 (SQLite AUTOINCREMENT)
+
+mutation 헤드리스 실측 후 DB를 복원하려고 `pnpm seed`를 재실행했더니 `me` 쿼리가 `null`로
+돌아왔다 — `Ava` 계정 자체가 사라진 것처럼 보였다. 원인을 실측으로 확인: `seed.ts`는 매번
+`deleteMany` 후 재생성하지만, `schema.prisma`의 `id Int @id @default(autoincrement())`가 SQLite에서
+`INTEGER PRIMARY KEY AUTOINCREMENT`로 매핑돼 `sqlite_sequence` 테이블에 지금까지의 최대 id를
+누적 기록한다. `DELETE`는 이 카운터를 리셋하지 않으므로 재시드할 때마다 id가 계속 밀린다(실측:
+이번 재시드로 `User` 1-3 → 4-6, `Post` 1-30 → 31-60, `Comment` 1-120 → 121-240으로 이동,
+`sqlite3 prisma/dev.db "SELECT * FROM sqlite_sequence;"`로 확인).
+
+`ctx.userId` 기본값(`context.ts`, 헤더 없으면 `1`)과 `dataloader.test.ts`의 `post(id: 1)`이 둘 다
+"id 1이 존재한다"를 암묵 전제로 깔고 있어서, 이 드리프트가 쌓이면 (a) `me`가 `null`이 되어 P5가
+요구하는 재현 자체가 불가능해지고 (b) `dataloader.test.ts`는 존재하지 않는 `post(id:1)`에 대해
+`post: null`을 받고도 top-level 에러 없이 `queryCount<=3`을 통과해버리는 **잠식적 vacuous pass**가
+된다(실측: id 1이 없는 상태에서도 `pnpm test`는 여전히 "2 passed" — 눈에 안 띄는 회귀). P2 README가
+재시드 대신 "mutation으로 이름을 도로 `Ava`로 저장"하는 방식을 택했던 이유가 바로 이것이었다고
+추정된다(당시엔 이유가 문서화되지 않았으나, 이번에 근본 원인을 확인했다).
+
+복원은 `sqlite_sequence` 카운터를 먼저 리셋한 뒤 재시드하는 것으로 처리했다:
+
+```bash
+sqlite3 prisma/dev.db "DELETE FROM sqlite_sequence WHERE name IN ('User','Post','Comment','Like');"
+pnpm --filter server seed
+```
+
+재확인: `User` 1=Ava/2=Ben/3=Cho, `Post` 1-30, `Comment` 1-120로 완전히 원래 시드 상태 복원,
+`me` 쿼리 `{"id":1,"name":"Ava"}`, `pnpm test` 2 passed(원래 2 test files 그대로).
+
+### 수동 재현 절차 (3) — 미실행, 헤드리스 환경 한계
+
+아래는 브라우저에서 David가 직접 확인할 절차다. **에이전트는 브라우저를 조작하지 않았고 이
+단계를 실행/관찰하지 않았다** — React 재렌더는 실제 브라우저의 React 트리 없이는 증명할 수 없는
+사실이라 절차만 기록해둔다.
+
+1. Apollo Client Devtools 브라우저 확장 설치
+2. `pnpm dev:server` + `pnpm dev:web` 후 `http://localhost:5173` 접속
+3. 피드 탭 — Ava의 글이 보임
+4. 프로필 탭 — 이름을 `Ava2`로 바꾸고 저장 → "저장됨: Ava2" 확인
+5. Apollo Devtools "Cache" 탭에서 `User:1` 엔트리를 열어 `name`이 `"Ava2"`로 바뀐 것을 확인
+   (스크린샷 — P2 때의 Map 캐시에는 애초에 이런 엔티티 단위 뷰가 없었다는 점과 대비)
+6. 피드 탭으로 복귀 — **refetch 코드가 한 줄도 없는데 `Ava2`가 보이는지** 확인 (P2에서는 4단계에서
+   여전히 `Ava`였던 것과 정반대 결과여야 한다)
+7. 브라우저 Network 탭에서 6번 시점에 `/graphql` feed 요청이 **새로 나가지 않았는지** 확인 —
+   나가지 않았다면 네트워크가 아니라 캐시(`User:1` 갱신)만으로 피드가 다시 그려졌다는 뜻
+8. 확인 후 복원: `cd server && sqlite3 prisma/dev.db "DELETE FROM sqlite_sequence WHERE name IN ('User','Post','Comment','Like');" && pnpm seed` (위 편차 기록대로 시퀀스 리셋을 먼저 해야
+   진짜 시드 상태로 돌아간다 — `pnpm seed`만 다시 돌리면 id가 또 밀린다)
+
+### 질문 1 (React Query와의 차이)
+
+> ✍️ 여기에 내 답을 쓴다:
